@@ -531,6 +531,14 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if err != nil {
 				break
 			}
+			// Keep talking the way Dest does once the handshake is over; see
+			// reality_record_shape.go for why silence here is a giveaway.
+			if shape := realityRecordShape(config, hs.clientHello.serverName, hs.clientHello.alpnProtocols); len(shape) > 0 {
+				hs.writeRealityShapeRecords(shape)
+				if config.Log != nil {
+					config.Log("REALITY remoteAddr: %v post-handshake shape: %v", remoteAddr, shape)
+				}
+			}
 			hs.c.isHandshakeComplete.Store(true)
 			break
 		}
@@ -602,6 +610,7 @@ func NewRealityListener(inner net.Listener, config *RealityConfig) net.Listener 
 	l := new(realityListener)
 	l.Listener = inner
 	l.config = config
+	detectRealityRecordShape(config)
 	{
 		l.conns = make(chan net.Conn)
 		go func() {
