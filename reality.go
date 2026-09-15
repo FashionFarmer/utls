@@ -97,10 +97,15 @@ type RealityLimitFallback struct {
 type RealityConfig struct {
 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 
-	Log  func(format string, v ...any)
-	Type string
-	Dest string
-	Xver byte
+	Log func(format string, v ...any)
+	// Observe, if set, is called exactly once per inbound connection when
+	// RealityServer has decided its outcome. It runs on the connection's own
+	// goroutine before Accept can yield it, so it must return quickly and must
+	// not panic (the listener recovers panics by dropping the connection).
+	Observe func(RealityObservation)
+	Type    string
+	Dest    string
+	Xver    byte
 
 	ServerNames  map[string]bool
 	PrivateKey   []byte
@@ -119,6 +124,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 	return &RealityConfig{
 		DialContext:           a.DialContext,
 		Log:                   a.Log,
+		Observe:               a.Observe,
 		Type:                  a.Type,
 		Dest:                  a.Dest,
 		Xver:                  a.Xver,
@@ -322,10 +328,26 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	if config.Log != nil {
 		config.Log("REALITY remoteAddr: %v", remoteAddr)
 	}
+	start := time.Now()
+	// reason is written only while mutex is held (or before the goroutines
+	// start / after they finish), and read once at the end.
+	reason := ""
+	observe := func(outcome RealityOutcome, serverName, why string) {
+		if config.Observe != nil {
+			config.Observe(RealityObservation{
+				RemoteAddr: remoteAddr,
+				ServerName: serverName,
+				Outcome:    outcome,
+				Reason:     why,
+				Duration:   time.Since(start),
+			})
+		}
+	}
 
 	target, err := config.DialContext(ctx, config.Type, config.Dest)
 	if err != nil {
 		conn.Close()
+		observe(RealityFailed, "", "dest_dial_failed")
 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
 	}
 
@@ -357,7 +379,18 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		for {
 			mutex.Lock()
 			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
-			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
+			// Same checks, same order as before; only the reason is recorded.
+			switch {
+			case copying:
+				reason = "dest_spoke_first"
+			case err != nil:
+				reason = "client_hello_invalid"
+			case hs.c.vers != VersionTLS13:
+				reason = "not_tls13"
+			case !config.ServerNames[hs.clientHello.serverName]:
+				reason = "server_name_not_allowed"
+			}
+			if reason != "" {
 				break
 			}
 			var peerPub []byte
@@ -375,11 +408,16 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 					}
 				}
 			}
+			if peerPub == nil {
+				reason = "no_x25519_key_share"
+			}
 			for peerPub != nil {
 				if hs.AuthKey, err = curve25519.X25519(config.PrivateKey, peerPub); err != nil {
+					reason = "key_exchange_error"
 					break
 				}
 				if _, err = hkdf.New(sha256.New, hs.AuthKey, hs.clientHello.random[:20], []byte("REALITY")).Read(hs.AuthKey); err != nil {
+					reason = "key_exchange_error"
 					break
 				}
 				block, _ := aes.NewCipher(hs.AuthKey)
@@ -392,6 +430,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				copy(ciphertext, hs.clientHello.sessionId)
 				copy(hs.clientHello.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
 				if _, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, hs.clientHello.original); err != nil {
+					reason = "not_reality_client"
 					break
 				}
 				copy(hs.clientHello.sessionId, ciphertext)
@@ -403,10 +442,17 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 					config.Log("REALITY remoteAddr: %v hs.c.ClientTime: %v", remoteAddr, hs.ClientTime)
 					config.Log("REALITY remoteAddr: %v hs.c.ClientShortId: %v", remoteAddr, hs.ClientShortId)
 				}
-				if (config.MinClientVer == nil || realityValue(hs.ClientVer[:]...) >= realityValue(config.MinClientVer...)) &&
-					(config.MaxClientVer == nil || realityValue(hs.ClientVer[:]...) <= realityValue(config.MaxClientVer...)) &&
-					(config.MaxTimeDiff == 0 || config.time().Sub(hs.ClientTime).Abs() <= config.MaxTimeDiff) &&
-					(config.ShortIds[hs.ClientShortId]) {
+				// The negation of the original acceptance test, split so the
+				// failing clause is known.
+				switch {
+				case config.MinClientVer != nil && realityValue(hs.ClientVer[:]...) < realityValue(config.MinClientVer...),
+					config.MaxClientVer != nil && realityValue(hs.ClientVer[:]...) > realityValue(config.MaxClientVer...):
+					reason = "client_version_rejected"
+				case config.MaxTimeDiff != 0 && config.time().Sub(hs.ClientTime).Abs() > config.MaxTimeDiff:
+					reason = "client_time_rejected"
+				case !config.ShortIds[hs.ClientShortId]:
+					reason = "short_id_unknown"
+				default:
 					hs.c.conn = conn
 				}
 				break
@@ -509,6 +555,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				config.Log("REALITY remoteAddr: %v hs.handshake() err: %v", remoteAddr, err)
 			}
 			if err != nil {
+				reason = "server_handshake_error"
 				break
 			}
 			go func() { // TODO: Probe target's maxUselessRecords and some time-outs in advance.
@@ -529,6 +576,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				config.Log("REALITY remoteAddr: %v hs.readClientFinished() err: %v", remoteAddr, err)
 			}
 			if err != nil {
+				reason = "client_finished_error"
 				break
 			}
 			// Keep talking the way Dest does once the handshake is over; see
@@ -541,6 +589,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			}
 			hs.c.isHandshakeComplete.Store(true)
 			break
+		}
+		if hs.c.out.handshakeLen[0] == 0 && hs.c.conn == conn && reason == "" {
+			reason = "dest_server_hello_invalid"
 		}
 		mutex.Unlock()
 		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
@@ -562,10 +613,23 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	if config.Log != nil {
 		config.Log("REALITY remoteAddr: %v hs.c.isHandshakeComplete.Load(): %v", remoteAddr, hs.c.isHandshakeComplete.Load())
 	}
+	serverName := ""
+	if hs.clientHello != nil {
+		serverName = hs.clientHello.serverName
+	}
 	if hs.c.isHandshakeComplete.Load() {
+		observe(RealityAuthenticated, serverName, "")
 		return hs.c, nil
 	}
 	conn.Close()
+	outcome := RealityFailed
+	if hs.c.conn != conn {
+		outcome = RealityFallback
+	}
+	if reason == "" {
+		reason = "incomplete"
+	}
+	observe(outcome, serverName, reason)
 	return nil, errors.New("REALITY: processed invalid connection") // TODO: Add details.
 
 	/*
